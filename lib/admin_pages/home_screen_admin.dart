@@ -31,7 +31,7 @@ class HomeScreenAdmin extends StatelessWidget {
             ),
           ),
         ),
-        backgroundColor: const Color.fromARGB(255, 47, 7, 226),
+        backgroundColor: const Color.fromARGB(25, 47, 7, 226),
       ),
       body: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 10.0),
