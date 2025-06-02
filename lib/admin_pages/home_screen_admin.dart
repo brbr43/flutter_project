@@ -26,7 +26,7 @@ class HomeScreenAdmin extends StatelessWidget {
             'Welcome',
             style: TextStyle(
               fontSize: 20,
-              color: Colors.white,
+              color: Colors.black,
               fontFamily: 'Pacifico',
             ),
           ),
