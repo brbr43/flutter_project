@@ -1,4 +1,4 @@
-"""FastAPI entrypoint — StoryVerse Phase 4 internal API."""
+"""FastAPI entrypoint — StoryVerse Phase 5 internal API (ComfyUI image adapter)."""
 
 from __future__ import annotations
 
@@ -28,10 +28,13 @@ async def lifespan(_app: FastAPI):
     await requeue_orphans()
     gate = inspect_llm_gates(settings)
     logger.info(
-        "StoryVerse API ready root=%s db=%s (no ML loaded; story backend=%s)",
+        "StoryVerse API ready root=%s db=%s story=%s comfyui=%s checkpoint=%s "
+        "(no model downloads; single GPU-style worker)",
         settings.root,
         settings.db_path,
         gate.active_backend,
+        settings.comfyui_base_url,
+        settings.comfyui_checkpoint,
     )
     yield
     await job_queue.stop()
@@ -43,9 +46,10 @@ def create_app() -> FastAPI:
         title=settings.api_title,
         version=__version__,
         description=(
-            "StoryVerse AI Studio — Phase 4 story/script/scenes API. "
-            "Template generator by default. No ComfyUI, no model downloads, "
-            "no paid APIs unless STORYVERSE_ALLOW_CLOUD_LLM=1 + key (still gated)."
+            "StoryVerse AI Studio — Phase 5 ComfyUI image adapter on Phase 4 story API. "
+            "Uses existing DreamShaper_8_pruned.safetensors via local ComfyUI "
+            f"({settings.comfyui_base_url}). No model downloads. No paid APIs. "
+            "Single-worker queue serializes GPU jobs."
         ),
         lifespan=lifespan,
     )

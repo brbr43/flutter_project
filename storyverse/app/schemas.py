@@ -1,4 +1,4 @@
-"""Pydantic request/response schemas — Phase 3 + Phase 4 story/script."""
+"""Pydantic request/response schemas — Phase 3–5 (story + ComfyUI images)."""
 
 from __future__ import annotations
 
@@ -177,7 +177,18 @@ class LLMGateOut(BaseModel):
 class CharacterCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = ""
+    # Optional light visual stub (also accepted via meta.visual_prompt)
+    visual_prompt: str = ""
+    reference_notes: str = ""
     meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class CharacterUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    visual_prompt: Optional[str] = None
+    reference_notes: Optional[str] = None
+    meta: Optional[dict[str, Any]] = None
 
 
 class CharacterOut(ORMModel):
@@ -188,6 +199,34 @@ class CharacterOut(ORMModel):
     meta: Optional[dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
+
+
+class CharacterRefStubOut(BaseModel):
+    character_id: int
+    project_id: int
+    refs_dir: str
+    readme: str
+    stub: bool = True
+    note: str = "Light reference stub only — no image generation / no model download"
+
+
+# --- Image generation (Phase 5) ---
+
+
+class ImageGenerateRequest(BaseModel):
+    """Trigger ComfyUI image generation for one scene (queued, single worker)."""
+
+    prompt_override: Optional[str] = None
+    negative_prompt: Optional[str] = None
+    extra_prompt: str = ""
+    character_ids: list[int] = Field(default_factory=list)
+    seed: Optional[int] = None
+    steps: Optional[int] = None
+    cfg: Optional[float] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    # Must remain a local ComfyUI checkpoint filename — default DreamShaper_8_pruned
+    checkpoint: Optional[str] = None
 
 
 # --- Assets ---
@@ -237,6 +276,16 @@ class JobOut(ORMModel):
     finished_at: Optional[datetime] = None
 
 
+class ImageGenerateOut(BaseModel):
+    job: JobOut
+    scene_id: int
+    project_id: int
+    note: str = (
+        "Queued image_generate. Prior scene image versions are kept; "
+        "other scenes are not modified."
+    )
+
+
 # --- Settings ---
 
 
@@ -264,3 +313,6 @@ class HealthOut(BaseModel):
     story_backend: str = "template"
     allow_local_llm: bool = False
     allow_cloud_llm: bool = False
+    comfyui_base_url: str = "http://127.0.0.1:8188"
+    comfyui_checkpoint: str = "DreamShaper_8_pruned.safetensors"
+    image_engine: str = "comfyui"
