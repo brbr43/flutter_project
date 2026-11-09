@@ -1,3 +1,3 @@
-"""StoryVerse AI Studio — Phase 3 app core (storage + API + single-worker queue)."""
+"""StoryVerse AI Studio — Phase 4 story/script/scenes on Phase 3 core."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

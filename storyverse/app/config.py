@@ -38,7 +38,16 @@ class Settings(BaseSettings):
     # Fake job simulation delay (seconds) for smoke / demo workers
     fake_job_delay_sec: float = 0.25
     api_title: str = "StoryVerse Internal API"
-    api_version: str = "0.3.0"
+    api_version: str = "0.4.0"
+
+    # Phase 4 — LLM gates (OFF by default; no model downloads; no paid APIs)
+    # STORYVERSE_ALLOW_LOCAL_LLM=1  → local LLM *permission* only (still unused in Phase 4)
+    # STORYVERSE_ALLOW_CLOUD_LLM=1 + STORYVERSE_CLOUD_LLM_API_KEY → cloud gate documented;
+    #   Phase 4 does not auto-call paid APIs; template generator remains the working path.
+    allow_local_llm: bool = False
+    allow_cloud_llm: bool = False
+    cloud_llm_api_key: str = ""
+
 
     def model_post_init(self, __context: object) -> None:
         # Allow STORYVERSE_ROOT to set root; also accept bare ROOT via os.environ
