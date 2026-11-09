@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-StoryVerse Phase 5 smoke test.
+StoryVerse Phase 6 smoke test.
 
 - Phase 4 story flow (template generator, no ML weights)
 - Phase 5 image_generate via a **mock ComfyUI HTTP server** (no GPU, no real ComfyUI)
-- Regenerates one scene → new version; other scene assets untouched
-- Character reference stub (light)
+- Phase 6 video_generate via **FFmpeg Ken Burns fallback** (labeled non-AI; no model download)
+- Regenerates clips → new version; other scene assets untouched
+- AI video gates stay OFF; download URLs rejected
 
-NO model downloads. NO paid APIs.
+NO model downloads. NO paid APIs. Does NOT claim AI video works.
 
 Usage (from storyverse/ — CI / cloud):
 
   python scripts/smoke_test.py
 
-Against a running API (mock ComfyUI must still be reachable at
-STORYVERSE_COMFYUI_BASE_URL, or use --skip-image):
+Against a running API:
 
   python scripts/smoke_test.py --base-url http://127.0.0.1:8765
-
-Windows live test with real ComfyUI: see README § Windows live image test.
 """
 
 from __future__ import annotations
@@ -100,6 +98,19 @@ async def _assert_story_flow(client) -> int:
     assert health["story_backend"] == "template"
     assert health.get("image_engine") == "comfyui"
     assert "DreamShaper_8_pruned" in health.get("comfyui_checkpoint", "")
+    assert health.get("video_engine") == "ffmpeg_kenburns"
+    assert health.get("allow_ai_video") is False
+    assert health.get("allow_video_model_download") is False
+    assert health.get("ai_video_active") is False
+    assert health.get("video_is_fallback") is True
+    assert str(health.get("version", "")).startswith("0.6")
+
+    r = await client.get("/api/v1/video/gates")
+    r.raise_for_status()
+    gates = r.json()
+    assert gates["is_fallback"] is True
+    assert gates["ai_video_active"] is False
+    print(f"[smoke] video gates ok engine={gates['engine']} fallback={gates['is_fallback']}")
 
     r = await client.get("/api/v1/story/genres")
     r.raise_for_status()
@@ -134,7 +145,7 @@ async def _assert_story_flow(client) -> int:
     return project_id
 
 
-async def _assert_image_flow(client, project_id: int, timeout_sec: float) -> None:
+async def _assert_image_flow(client, project_id: int, timeout_sec: float) -> tuple[dict, dict]:
     r = await client.get(f"/api/v1/projects/{project_id}/scenes")
     r.raise_for_status()
     scenes = r.json()
@@ -187,7 +198,6 @@ async def _assert_image_flow(client, project_id: int, timeout_sec: float) -> Non
             f"path={final['result'].get('path')}"
         )
 
-    # Assets exist on disk
     from app.config import get_settings
 
     settings = get_settings()
@@ -196,14 +206,12 @@ async def _assert_image_flow(client, project_id: int, timeout_sec: float) -> Non
         assert abs_path.is_file(), abs_path
         assert abs_path.stat().st_size > 20
 
-    # List images for scene 1
     r = await client.get(f"/api/v1/scenes/{s1['id']}/images")
     r.raise_for_status()
     imgs1 = r.json()
     assert len(imgs1) == 1
     assert imgs1[0]["kind"] == "scene_image"
     assert imgs1[0]["meta"]["version"] == 1
-    assert imgs1[0]["meta"]["checkpoint"] == "DreamShaper_8_pruned.safetensors"
 
     r = await client.get(f"/api/v1/scenes/{s2['id']}/images")
     r.raise_for_status()
@@ -253,9 +261,127 @@ async def _assert_image_flow(client, project_id: int, timeout_sec: float) -> Non
     )
     assert r.status_code == 400
     print("[smoke] rejected remote checkpoint URL")
+    return s1, s2
 
 
-async def run_inprocess(timeout_sec: float = 30.0) -> int:
+async def _assert_video_flow(
+    client, project_id: int, s1: dict, s2: dict, timeout_sec: float
+) -> None:
+    # Two short clips via FFmpeg Ken Burns fallback (NOT AI)
+    job_ids: list[int] = []
+    for sc in (s1, s2):
+        r = await client.post(
+            f"/api/v1/scenes/{sc['id']}/generate-clip",
+            json={"duration_sec": 1.0, "fps": 8, "width": 320, "height": 240},
+        )
+        r.raise_for_status()
+        out = r.json()
+        assert out["job"]["job_type"] == "video_generate"
+        assert out["job"]["status"] == "queued"
+        job_ids.append(out["job"]["id"])
+        print(f"[smoke] queued video_generate job={out['job']['id']} scene={sc['id']}")
+
+    results = []
+    for jid in job_ids:
+        final = await _wait_job(client, jid, timeout_sec)
+        assert final["status"] == "done", final
+        assert final["result"] and final["result"].get("ok") is True
+        assert final["result"].get("ai_video") is False
+        assert final["result"].get("fallback") is True
+        assert final["result"].get("engine") == "ffmpeg_kenburns"
+        assert final["result"].get("version") >= 1
+        abs_path = Path(final["result"]["absolute_path"])
+        assert abs_path.is_file(), abs_path
+        assert abs_path.suffix.lower() == ".mp4"
+        assert abs_path.stat().st_size > 100
+        results.append(final)
+        print(
+            f"[smoke] video job done id={jid} version={final['result']['version']} "
+            f"engine={final['result']['engine']} ai_video={final['result']['ai_video']}"
+        )
+
+    r = await client.get(f"/api/v1/scenes/{s1['id']}/clips")
+    r.raise_for_status()
+    clips1 = r.json()
+    assert len(clips1) == 1
+    assert clips1[0]["kind"] == "scene_clip"
+    assert clips1[0]["meta"]["version"] == 1
+    assert clips1[0]["meta"]["ai_video"] is False
+    assert clips1[0]["meta"]["fallback"] is True
+
+    r = await client.get(f"/api/v1/scenes/{s2['id']}/clips")
+    r.raise_for_status()
+    clips2_before = r.json()
+    assert len(clips2_before) == 1
+    s2_clip_v1 = clips2_before[0]["path"]
+
+    # Regenerate scene 1 clip → v002; scene 2 untouched
+    r = await client.post(
+        f"/api/v1/scenes/{s1['id']}/generate-clip",
+        json={"duration_sec": 1.0, "fps": 8, "width": 320, "height": 240},
+    )
+    r.raise_for_status()
+    regen = await _wait_job(client, r.json()["job"]["id"], timeout_sec)
+    assert regen["status"] == "done", regen
+    assert regen["result"]["version"] == 2
+    assert regen["result"]["ai_video"] is False
+    print(f"[smoke] regenerate clip scene={s1['id']} → version=2 (fallback)")
+
+    r = await client.get(f"/api/v1/scenes/{s1['id']}/clips")
+    r.raise_for_status()
+    clips1_after = r.json()
+    assert len(clips1_after) == 2
+    assert sorted(c["meta"]["version"] for c in clips1_after) == [1, 2]
+
+    r = await client.get(f"/api/v1/scenes/{s2['id']}/clips")
+    r.raise_for_status()
+    clips2_after = r.json()
+    assert len(clips2_after) == 1
+    assert clips2_after[0]["path"] == s2_clip_v1
+    print("[smoke] clip regenerate kept other scene clips intact")
+
+    # Reject remote model / source URLs
+    r = await client.post(
+        f"/api/v1/scenes/{s1['id']}/generate-clip",
+        json={"model": "https://huggingface.co/fake/model.safetensors"},
+    )
+    assert r.status_code == 400
+    r = await client.post(
+        f"/api/v1/scenes/{s1['id']}/generate-clip",
+        json={"source_image_path": "https://example.com/still.png"},
+    )
+    assert r.status_code == 400
+    print("[smoke] rejected remote video model / source URLs")
+
+    # AI engine without approval must fail the job (honest refusal)
+    r = await client.post(
+        f"/api/v1/scenes/{s1['id']}/generate-clip",
+        json={"engine": "comfyui_wan", "duration_sec": 1.0},
+    )
+    r.raise_for_status()
+    refused = await _wait_job(client, r.json()["job"]["id"], timeout_sec)
+    assert refused["status"] == "failed", refused
+    assert refused.get("error_message")
+    assert "ALLOW_AI_VIDEO" in refused["error_message"] or "AI video" in refused["error_message"]
+    print("[smoke] AI video engine correctly refused without approval")
+
+    # Jobs API accepts video_generate
+    r = await client.post(
+        f"/api/v1/projects/{project_id}/jobs",
+        json={
+            "job_type": "video_generate",
+            "scene_id": s2["id"],
+            "payload": {"duration_sec": 1.0, "fps": 8, "width": 320, "height": 240},
+        },
+    )
+    r.raise_for_status()
+    via_jobs = await _wait_job(client, r.json()["id"], timeout_sec)
+    assert via_jobs["status"] == "done", via_jobs
+    assert via_jobs["result"]["ai_video"] is False
+    print("[smoke] video_generate via /jobs OK")
+
+
+async def run_inprocess(timeout_sec: float = 60.0) -> int:
     tmp_root = None
     if not os.environ.get("STORYVERSE_ROOT"):
         tmp_root = tempfile.mkdtemp(prefix="storyverse-smoke-")
@@ -264,6 +390,9 @@ async def run_inprocess(timeout_sec: float = 30.0) -> int:
     os.environ.pop("STORYVERSE_ALLOW_LOCAL_LLM", None)
     os.environ.pop("STORYVERSE_ALLOW_CLOUD_LLM", None)
     os.environ.pop("STORYVERSE_CLOUD_LLM_API_KEY", None)
+    os.environ.pop("STORYVERSE_ALLOW_AI_VIDEO", None)
+    os.environ.pop("STORYVERSE_ALLOW_VIDEO_MODEL_DOWNLOAD", None)
+    os.environ["STORYVERSE_VIDEO_ENGINE"] = "ffmpeg_kenburns"
 
     mock_port = _free_port()
     os.environ["STORYVERSE_COMFYUI_BASE_URL"] = f"http://127.0.0.1:{mock_port}"
@@ -280,7 +409,11 @@ async def run_inprocess(timeout_sec: float = 30.0) -> int:
     settings = get_settings()
     print(f"[smoke] STORYVERSE_ROOT={settings.root}")
     print(f"[smoke] comfyui={settings.comfyui_base_url}")
+    print(f"[smoke] video_engine={settings.video_engine}")
     assert settings.comfyui_checkpoint == "DreamShaper_8_pruned.safetensors"
+    assert settings.video_engine == "ffmpeg_kenburns"
+    assert settings.allow_ai_video is False
+    assert settings.allow_video_model_download is False
 
     from fastapi import FastAPI
 
@@ -300,9 +433,11 @@ async def run_inprocess(timeout_sec: float = 30.0) -> int:
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             project_id = await _assert_story_flow(client)
-            await _assert_image_flow(client, project_id, timeout_sec)
+            s1, s2 = await _assert_image_flow(client, project_id, timeout_sec)
+            await _assert_video_flow(client, project_id, s1, s2, timeout_sec)
             print(
                 "[smoke] PASS — story + image_generate (mock ComfyUI) + "
+                "video_generate (ffmpeg Ken Burns fallback, NOT AI) + "
                 "versioned regenerate (no GPU / no model download)"
             )
     finally:
@@ -311,7 +446,12 @@ async def run_inprocess(timeout_sec: float = 30.0) -> int:
     return 0
 
 
-async def run_against_url(base_url: str, timeout_sec: float = 60.0, skip_image: bool = False) -> int:
+async def run_against_url(
+    base_url: str,
+    timeout_sec: float = 90.0,
+    skip_image: bool = False,
+    skip_video: bool = False,
+) -> int:
     import httpx
 
     base = base_url.rstrip("/")
@@ -320,33 +460,47 @@ async def run_against_url(base_url: str, timeout_sec: float = 60.0, skip_image: 
         if skip_image:
             print("[smoke] PASS against live API (story only; --skip-image)")
             return 0
-        await _assert_image_flow(client, project_id, timeout_sec)
-        print("[smoke] PASS against live API (story + image_generate)")
+        s1, s2 = await _assert_image_flow(client, project_id, timeout_sec)
+        if skip_video:
+            print("[smoke] PASS against live API (story + image; --skip-video)")
+            return 0
+        await _assert_video_flow(client, project_id, s1, s2, timeout_sec)
+        print("[smoke] PASS against live API (story + image + video fallback)")
         return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="StoryVerse Phase 5 smoke (mock ComfyUI by default)"
+        description="StoryVerse Phase 6 smoke (mock ComfyUI + FFmpeg fallback)"
     )
     parser.add_argument(
         "--base-url",
         default="",
         help="Hit a running server. For image jobs, ComfyUI (or mock) must match "
-        "that server's STORYVERSE_COMFYUI_BASE_URL.",
+        "that server's STORYVERSE_COMFYUI_BASE_URL. Video default needs ffmpeg.",
     )
     parser.add_argument(
         "--skip-image",
         action="store_true",
         help="With --base-url, only run Phase 4 story checks",
     )
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--skip-video",
+        action="store_true",
+        help="With --base-url, skip Phase 6 clip checks",
+    )
+    parser.add_argument("--timeout", type=float, default=60.0)
     args = parser.parse_args()
 
     try:
         if args.base_url:
             return asyncio.run(
-                run_against_url(args.base_url, args.timeout, skip_image=args.skip_image)
+                run_against_url(
+                    args.base_url,
+                    args.timeout,
+                    skip_image=args.skip_image,
+                    skip_video=args.skip_video,
+                )
             )
         return asyncio.run(run_inprocess(args.timeout))
     except Exception as exc:  # noqa: BLE001

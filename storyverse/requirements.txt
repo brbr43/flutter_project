@@ -1,6 +1,7 @@
-# StoryVerse Phase 5 — light deps only (same as Phase 3/4).
+# StoryVerse Phase 6 — light deps only (same as Phase 3–5).
 # NO torch, NO torchvision, NO model download packages, NO paid API SDKs.
 # ComfyUI runs as a separate process; this app talks to it over HTTP only.
+# Video default path uses system ffmpeg (Ken Burns fallback) — not bundled here.
 fastapi>=0.115.0,<1.0
 uvicorn[standard]>=0.32.0,<1.0
 sqlalchemy[asyncio]>=2.0.36,<3.0
