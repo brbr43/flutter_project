@@ -1,11 +1,11 @@
-"""SQLAlchemy ORM models — Phase 3 schema."""
+"""SQLAlchemy ORM models — Phase 3 schema + Phase 4 story/script fields."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -24,6 +24,15 @@ class Project(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # Phase 4 — story / script draft persisted on the project
+    idea: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    genre: Mapped[str] = mapped_column(String(40), default="drama", nullable=False)
+    true_story_mode: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    script_title: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    synopsis: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    beats: Mapped[Optional[list[Any]]] = mapped_column(JSON, default=list)
+    generator: Mapped[str] = mapped_column(String(40), default="template", nullable=False)
+    story_meta: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -46,6 +55,13 @@ class Scene(Base):
     order_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     script_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # Phase 4 cinematic fields
+    camera: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    lighting: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    beat_id: Mapped[str] = mapped_column(String(80), default="", nullable=False)
+    content_tag: Mapped[str] = mapped_column(String(40), default="fiction", nullable=False)
+    duration_hint_sec: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    meta: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(40), default="draft", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

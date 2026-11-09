@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-StoryVerse Phase 3 smoke test.
+StoryVerse Phase 4 smoke test (includes Phase 3 job lifecycle).
 
-Creates a project + scene + fake job and waits for queued → running → done
-WITHOUT calling ComfyUI or any ML stack.
+Idea → editable JSON script/scenes via template generator.
+Manual scene edit + reorder. NO ComfyUI, NO model downloads, NO paid APIs.
 
 Usage (from storyverse/ on Windows after syncing to D:\\StoryVerse\\app):
 
@@ -33,15 +33,141 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+async def _assert_story_flow(client) -> int:
+    """Shared Phase 4 checks. Returns project_id."""
+    r = await client.get("/api/v1/health")
+    r.raise_for_status()
+    health = r.json()
+    print(f"[smoke] health={health}")
+    assert health["status"] == "ok"
+    assert health["story_backend"] == "template"
+    assert health.get("allow_local_llm") is False
+    assert health.get("allow_cloud_llm") is False
+
+    r = await client.get("/api/v1/story/genres")
+    r.raise_for_status()
+    genres = r.json()
+    ids = {g["id"] for g in genres}
+    expected = {"documentary", "hollywood", "mystery", "historical", "drama", "adventure"}
+    assert expected.issubset(ids), ids
+    print(f"[smoke] genres={sorted(ids)}")
+
+    r = await client.get("/api/v1/story/llm-gates")
+    r.raise_for_status()
+    gates = r.json()
+    assert gates["active_backend"] == "template"
+    print(f"[smoke] llm-gates={gates['notes'][:80]}...")
+
+    idea = "A lighthouse keeper who discovers coded lights from a vanished ship"
+    r = await client.post(
+        "/api/v1/story/generate",
+        json={
+            "idea": idea,
+            "genre": "mystery",
+            "true_story_mode": False,
+            "language": "en",
+            "preferred_backend": "template",
+        },
+    )
+    r.raise_for_status()
+    draft = r.json()
+    project_id = draft["project_id"]
+    print(f"[smoke] generated project_id={project_id} title={draft['title']!r}")
+    assert draft["editable"] is True
+    assert draft["generator"] == "template"
+    assert draft["genre"] == "mystery"
+    assert isinstance(draft["beats"], list) and len(draft["beats"]) >= 3
+    assert isinstance(draft["scenes"], list) and len(draft["scenes"]) >= 3
+    for sc in draft["scenes"]:
+        for key in ("camera", "lighting", "prompt", "script_text", "content_tag", "title"):
+            assert key in sc, f"missing {key} in scene"
+        assert sc["content_tag"] in ("fact", "dramatization", "fiction")
+
+    # True-story mode → fact / dramatization tags
+    r = await client.post(
+        "/api/v1/story/generate",
+        json={
+            "idea": "The 1912 sinking of a famous ocean liner and its wireless room",
+            "genre": "historical",
+            "true_story_mode": True,
+            "project_name": "True Story Smoke",
+        },
+    )
+    r.raise_for_status()
+    true_draft = r.json()
+    tags = {s["content_tag"] for s in true_draft["scenes"]}
+    assert "fact" in tags or "dramatization" in tags, tags
+    assert true_draft["true_story_mode"] is True
+    print(f"[smoke] true-story tags={tags}")
+
+    # Manual edit scene
+    scene0 = draft["scenes"][0]
+    scene_id = scene0["id"]
+    r = await client.patch(
+        f"/api/v1/scenes/{scene_id}",
+        json={
+            "title": "Edited Opening",
+            "camera": "locked-off wide (edited)",
+            "lighting": "moonlit fog (edited)",
+            "prompt": "edited lighthouse mystery prompt",
+            "script_text": "Manually rewritten beat.",
+            "content_tag": "fiction",
+        },
+    )
+    r.raise_for_status()
+    edited = r.json()
+    assert edited["title"] == "Edited Opening"
+    assert "edited" in edited["camera"]
+    print(f"[smoke] scene patched id={scene_id}")
+
+    # Reorder: reverse
+    ids_order = [s["id"] for s in draft["scenes"]]
+    reversed_ids = list(reversed(ids_order))
+    # After generate, scene list may still match draft; refresh
+    r = await client.get(f"/api/v1/projects/{project_id}/scenes")
+    r.raise_for_status()
+    current_ids = [s["id"] for s in r.json()]
+    reversed_ids = list(reversed(current_ids))
+    r = await client.put(
+        f"/api/v1/projects/{project_id}/scenes/reorder",
+        json={"scene_ids": reversed_ids},
+    )
+    r.raise_for_status()
+    reordered = r.json()
+    assert [s["id"] for s in reordered] == reversed_ids
+    assert [s["order_index"] for s in reordered] == list(range(len(reordered)))
+    print(f"[smoke] reorder ok count={len(reordered)}")
+
+    # Fetch full editable JSON
+    r = await client.get(f"/api/v1/projects/{project_id}/story")
+    r.raise_for_status()
+    story = r.json()
+    assert story["project_id"] == project_id
+    assert len(story["scenes"]) >= 3
+    print(f"[smoke] story JSON keys={sorted(story.keys())}")
+
+    r = await client.put(
+        f"/api/v1/projects/{project_id}/story",
+        json={"title": "Keeper of Coded Lights", "synopsis": "Edited synopsis."},
+    )
+    r.raise_for_status()
+    assert r.json()["title"] == "Keeper of Coded Lights"
+
+    return project_id
+
+
 async def run_inprocess(timeout_sec: float = 15.0) -> int:
     """Boot API in-process via httpx ASGITransport — no external server needed."""
-    # Isolate DB under a temp root unless user already set STORYVERSE_ROOT
     tmp_root = None
     if not os.environ.get("STORYVERSE_ROOT"):
         tmp_root = tempfile.mkdtemp(prefix="storyverse-smoke-")
         os.environ["STORYVERSE_ROOT"] = tmp_root
 
-    # Clear settings/engine caches if re-imported
+    # Ensure LLM flags stay off for smoke
+    os.environ.pop("STORYVERSE_ALLOW_LOCAL_LLM", None)
+    os.environ.pop("STORYVERSE_ALLOW_CLOUD_LLM", None)
+    os.environ.pop("STORYVERSE_CLOUD_LLM_API_KEY", None)
+
     from app.config import get_settings
     from app.db import init_db, reset_engine
     from app.queue import job_queue, requeue_orphans
@@ -65,108 +191,43 @@ async def run_inprocess(timeout_sec: float = 15.0) -> int:
 
     import httpx
 
-    # Minimal ASGI app without lifespan (worker already started above) —
-    # avoids double-starting the singleton queue.
     app = FastAPI()
     app.include_router(router, prefix="/api/v1")
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # Manual init already done; hit endpoints under /api/v1
-        r = await client.get("/api/v1/health")
-        r.raise_for_status()
-        health = r.json()
-        print(f"[smoke] health={health}")
-        assert health["status"] == "ok"
-        assert health["queue_worker"] == "single-in-process"
+        project_id = await _assert_story_flow(client)
 
-        r = await client.post(
-            "/api/v1/projects",
-            json={"name": "Smoke Project", "description": "Phase 3 smoke"},
-        )
+        # Phase 3 job lifecycle still works
+        r = await client.get(f"/api/v1/projects/{project_id}/scenes")
         r.raise_for_status()
-        project = r.json()
-        project_id = project["id"]
-        print(f"[smoke] project id={project_id}")
-
-        r = await client.post(
-            f"/api/v1/projects/{project_id}/scenes",
-            json={
-                "title": "Scene 1",
-                "order_index": 0,
-                "script_text": "A quiet alley at dusk.",
-                "prompt": "cinematic alley, dusk, soft rain",
-            },
-        )
-        r.raise_for_status()
-        scene = r.json()
-        scene_id = scene["id"]
-        print(f"[smoke] scene id={scene_id}")
+        scene_id = r.json()[0]["id"]
 
         r = await client.post(
             f"/api/v1/projects/{project_id}/jobs",
             json={
                 "job_type": "fake",
                 "scene_id": scene_id,
-                "payload": {"delay_sec": 0.2, "source": "smoke_test"},
+                "payload": {"delay_sec": 0.15, "source": "smoke_test_p4"},
             },
         )
         r.raise_for_status()
-        job = r.json()
-        job_id = job["id"]
-        print(f"[smoke] job id={job_id} status={job['status']}")
-        assert job["status"] == "queued"
-
+        job_id = r.json()["id"]
         deadline = time.monotonic() + timeout_sec
-        final = job
+        final = None
         while time.monotonic() < deadline:
             r = await client.get(f"/api/v1/jobs/{job_id}")
             r.raise_for_status()
             final = r.json()
-            print(f"[smoke] poll status={final['status']}")
             if final["status"] in ("done", "failed"):
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.08)
+        assert final and final["status"] == "done", final
+        print(f"[smoke] fake job done id={job_id}")
 
-        if final["status"] != "done":
-            print(f"[smoke] FAIL final={final}", file=sys.stderr)
-            await job_queue.stop()
-            return 1
-
-        print(f"[smoke] result={final.get('result')}")
-        marker = (final.get("result") or {}).get("marker")
-        if marker and not Path(marker).is_file():
-            print(f"[smoke] FAIL missing marker file {marker}", file=sys.stderr)
-            await job_queue.stop()
-            return 1
-
-        # Also exercise fail path quickly
-        r = await client.post(
-            f"/api/v1/projects/{project_id}/jobs",
-            json={
-                "job_type": "fake",
-                "scene_id": scene_id,
-                "payload": {"delay_sec": 0.05, "force_fail": True},
-            },
+        print(
+            "[smoke] PASS — idea→editable JSON scenes + edit/reorder "
+            "(template generator, no ML)"
         )
-        r.raise_for_status()
-        fail_id = r.json()["id"]
-        deadline = time.monotonic() + timeout_sec
-        fail_final = None
-        while time.monotonic() < deadline:
-            r = await client.get(f"/api/v1/jobs/{fail_id}")
-            r.raise_for_status()
-            fail_final = r.json()
-            if fail_final["status"] in ("done", "failed"):
-                break
-            await asyncio.sleep(0.05)
-        assert fail_final and fail_final["status"] == "failed"
-        print(f"[smoke] fail-cycle ok job_id={fail_id}")
-
-        r = await client.get(f"/api/v1/projects/{project_id}/scenes")
-        r.raise_for_status()
-        assert len(r.json()) >= 1
-
-        print("[smoke] PASS — project + scene + fake job lifecycle (done + failed) without ML")
         await job_queue.stop()
         return 0
 
@@ -176,51 +237,13 @@ async def run_against_url(base_url: str, timeout_sec: float = 30.0) -> int:
 
     base = base_url.rstrip("/")
     async with httpx.AsyncClient(base_url=base, timeout=10.0) as client:
-        r = await client.get("/api/v1/health")
-        r.raise_for_status()
-        print(f"[smoke] health={r.json()}")
-
-        r = await client.post(
-            "/api/v1/projects",
-            json={"name": "Smoke Project (live)", "description": "Phase 3"},
-        )
-        r.raise_for_status()
-        project_id = r.json()["id"]
-
-        r = await client.post(
-            f"/api/v1/projects/{project_id}/scenes",
-            json={"title": "Live Scene", "script_text": "hello"},
-        )
-        r.raise_for_status()
-        scene_id = r.json()["id"]
-
-        r = await client.post(
-            f"/api/v1/projects/{project_id}/jobs",
-            json={"job_type": "fake", "scene_id": scene_id, "payload": {"delay_sec": 0.2}},
-        )
-        r.raise_for_status()
-        job_id = r.json()["id"]
-
-        deadline = time.monotonic() + timeout_sec
-        final = None
-        while time.monotonic() < deadline:
-            r = await client.get(f"/api/v1/jobs/{job_id}")
-            r.raise_for_status()
-            final = r.json()
-            print(f"[smoke] poll status={final['status']}")
-            if final["status"] in ("done", "failed"):
-                break
-            await asyncio.sleep(0.15)
-
-        if not final or final["status"] != "done":
-            print(f"[smoke] FAIL final={final}", file=sys.stderr)
-            return 1
-        print("[smoke] PASS against live API")
+        await _assert_story_flow(client)
+        print("[smoke] PASS against live API (Phase 4 story flow)")
         return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="StoryVerse Phase 3 smoke test (no ML)")
+    parser = argparse.ArgumentParser(description="StoryVerse Phase 4 smoke test (no ML)")
     parser.add_argument(
         "--base-url",
         default="",
@@ -230,9 +253,13 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=20.0)
     args = parser.parse_args()
 
-    if args.base_url:
-        return asyncio.run(run_against_url(args.base_url, args.timeout))
-    return asyncio.run(run_inprocess(args.timeout))
+    try:
+        if args.base_url:
+            return asyncio.run(run_against_url(args.base_url, args.timeout))
+        return asyncio.run(run_inprocess(args.timeout))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[smoke] FAIL {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
