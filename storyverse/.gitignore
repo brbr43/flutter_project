@@ -1,0 +1,33 @@
+# Local data / runtime (never commit)
+data/
+.runtime/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Scratch artifacts under project roots
+**/scratch/
+**/exports/*.mp4
+**/exports/*.mov
+reports/
