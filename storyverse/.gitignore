@@ -1,0 +1,21 @@
+# Local env / tooling (never commit weights)
+venv/
+.venv/
+reports/
+apps/comfyui/
+models/
+scratch/
+exports/
+projects/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Model weight patterns (belt-and-suspenders)
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.bin
