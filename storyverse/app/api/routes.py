@@ -1,4 +1,4 @@
-"""HTTP endpoints — Phase 3 core + Phase 4 story/script/scenes."""
+"""HTTP endpoints — Phase 3–5 (story + ComfyUI scene images)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db import get_session
+from app.image.adapter import ASSET_KIND_SCENE_IMAGE, ensure_character_ref_stub
+from app.image.workflow import DEFAULT_CHECKPOINT
 from app.models import Asset, Character, Job, Project, Scene, Setting, utcnow
 from app.paths import ensure_project_layout
 from app.queue import job_queue
@@ -18,8 +20,12 @@ from app.schemas import (
     AssetOut,
     CharacterCreate,
     CharacterOut,
+    CharacterRefStubOut,
+    CharacterUpdate,
     GenreOut,
     HealthOut,
+    ImageGenerateOut,
+    ImageGenerateRequest,
     JobCreate,
     JobOut,
     LLMGateOut,
@@ -58,6 +64,9 @@ async def health() -> HealthOut:
         story_backend=gate.active_backend,
         allow_local_llm=settings.allow_local_llm,
         allow_cloud_llm=bool(settings.allow_cloud_llm and (settings.cloud_llm_api_key or "").strip()),
+        comfyui_base_url=settings.comfyui_base_url,
+        comfyui_checkpoint=settings.comfyui_checkpoint,
+        image_engine="comfyui",
     )
 
 
@@ -444,6 +453,23 @@ async def reorder_scenes(
 # ----- Characters -----
 
 
+def _merge_character_meta(
+    base: dict[str, Any] | None,
+    *,
+    visual_prompt: str | None = None,
+    reference_notes: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    meta = dict(base or {})
+    if extra:
+        meta.update(extra)
+    if visual_prompt is not None and visual_prompt.strip():
+        meta["visual_prompt"] = visual_prompt.strip()
+    if reference_notes is not None and reference_notes.strip():
+        meta["reference_notes"] = reference_notes.strip()
+    return meta
+
+
 @router.post(
     "/projects/{project_id}/characters",
     response_model=CharacterOut,
@@ -461,11 +487,17 @@ async def create_character(
         project_id=project_id,
         name=body.name.strip(),
         description=body.description,
-        meta=body.meta,
+        meta=_merge_character_meta(
+            body.meta,
+            visual_prompt=body.visual_prompt,
+            reference_notes=body.reference_notes,
+        ),
     )
     session.add(character)
     await session.commit()
     await session.refresh(character)
+    # Light stub folders (optional refs) — no generation
+    ensure_character_ref_stub(project_id, character.id)
     return character
 
 
@@ -481,6 +513,55 @@ async def list_characters(
         select(Character).where(Character.project_id == project_id).order_by(Character.id)
     )
     return list(result.scalars())
+
+
+@router.patch("/characters/{character_id}", response_model=CharacterOut)
+async def update_character(
+    character_id: int,
+    body: CharacterUpdate,
+    session: AsyncSession = Depends(get_session),
+) -> Character:
+    character = await session.get(Character, character_id)
+    if character is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    if body.name is not None:
+        character.name = body.name.strip()
+    if body.description is not None:
+        character.description = body.description
+    base_meta = dict(character.meta or {})
+    if body.meta is not None:
+        base_meta.update(body.meta)
+    character.meta = _merge_character_meta(
+        base_meta,
+        visual_prompt=body.visual_prompt,
+        reference_notes=body.reference_notes,
+    )
+    character.updated_at = utcnow()
+    await session.commit()
+    await session.refresh(character)
+    return character
+
+
+@router.post(
+    "/characters/{character_id}/ref-stub",
+    response_model=CharacterRefStubOut,
+)
+async def character_ref_stub(
+    character_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> CharacterRefStubOut:
+    """Ensure light character reference folder exists (no image gen / no downloads)."""
+    character = await session.get(Character, character_id)
+    if character is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    info = ensure_character_ref_stub(character.project_id, character.id)
+    return CharacterRefStubOut(
+        character_id=character.id,
+        project_id=character.project_id,
+        refs_dir=info["refs_dir"],
+        readme=info["readme"],
+        stub=True,
+    )
 
 
 # ----- Assets -----
@@ -535,6 +616,142 @@ async def list_assets(
     return list(result.scalars())
 
 
+# ----- Scene image generation (Phase 5) -----
+
+
+def _image_payload(body: ImageGenerateRequest) -> dict[str, Any]:
+    settings = get_settings()
+    payload: dict[str, Any] = {
+        "character_ids": list(body.character_ids or []),
+        "extra_prompt": body.extra_prompt or "",
+    }
+    if body.prompt_override is not None:
+        payload["prompt_override"] = body.prompt_override
+    if body.negative_prompt is not None:
+        payload["negative_prompt"] = body.negative_prompt
+    if body.seed is not None:
+        payload["seed"] = body.seed
+    if body.steps is not None:
+        payload["steps"] = body.steps
+    if body.cfg is not None:
+        payload["cfg"] = body.cfg
+    if body.width is not None:
+        payload["width"] = body.width
+    if body.height is not None:
+        payload["height"] = body.height
+    ckpt = (body.checkpoint or settings.comfyui_checkpoint or DEFAULT_CHECKPOINT).strip()
+    if "/" in ckpt or "\\" in ckpt or ckpt.startswith("http"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "checkpoint must be a local ComfyUI filename "
+                f"(default {DEFAULT_CHECKPOINT}); no download URLs"
+            ),
+        )
+    payload["checkpoint"] = ckpt
+    return payload
+
+
+async def _enqueue_image_job(
+    session: AsyncSession,
+    *,
+    project_id: int,
+    scene_id: int,
+    body: ImageGenerateRequest,
+) -> Job:
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    scene = await session.get(Scene, scene_id)
+    if scene is None or scene.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Scene not found in this project")
+    if body.character_ids:
+        result = await session.execute(
+            select(Character).where(
+                Character.project_id == project_id,
+                Character.id.in_(body.character_ids),
+            )
+        )
+        found = {c.id for c in result.scalars()}
+        missing = [cid for cid in body.character_ids if cid not in found]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"character_ids not in this project: {missing}",
+            )
+    job = Job(
+        project_id=project_id,
+        scene_id=scene_id,
+        job_type="image_generate",
+        status="queued",
+        payload=_image_payload(body),
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    await job_queue.enqueue(job.id)
+    return job
+
+
+@router.post(
+    "/scenes/{scene_id}/generate-image",
+    response_model=ImageGenerateOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def generate_scene_image_job(
+    scene_id: int,
+    body: ImageGenerateRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> ImageGenerateOut:
+    """Queue ComfyUI image generation for one scene (keeps prior versions)."""
+    scene = await session.get(Scene, scene_id)
+    if scene is None:
+        raise HTTPException(status_code=404, detail="Scene not found")
+    job = await _enqueue_image_job(
+        session,
+        project_id=scene.project_id,
+        scene_id=scene_id,
+        body=body or ImageGenerateRequest(),
+    )
+    return ImageGenerateOut(job=job, scene_id=scene_id, project_id=scene.project_id)
+
+
+@router.post(
+    "/projects/{project_id}/scenes/{scene_id}/generate-image",
+    response_model=ImageGenerateOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def generate_project_scene_image_job(
+    project_id: int,
+    scene_id: int,
+    body: ImageGenerateRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> ImageGenerateOut:
+    job = await _enqueue_image_job(
+        session,
+        project_id=project_id,
+        scene_id=scene_id,
+        body=body or ImageGenerateRequest(),
+    )
+    return ImageGenerateOut(job=job, scene_id=scene_id, project_id=project_id)
+
+
+@router.get("/scenes/{scene_id}/images", response_model=list[AssetOut])
+async def list_scene_images(
+    scene_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> list[Asset]:
+    scene = await session.get(Scene, scene_id)
+    if scene is None:
+        raise HTTPException(status_code=404, detail="Scene not found")
+    result = await session.execute(
+        select(Asset)
+        .where(Asset.scene_id == scene_id, Asset.kind == ASSET_KIND_SCENE_IMAGE)
+        .order_by(Asset.id)
+    )
+    return list(result.scalars())
+
+
 # ----- Jobs -----
 
 
@@ -555,12 +772,23 @@ async def create_job(
         scene = await session.get(Scene, body.scene_id)
         if scene is None or scene.project_id != project_id:
             raise HTTPException(status_code=400, detail="scene_id not in this project")
+    allowed = {"fake", "image_generate"}
+    if body.job_type not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"job_type must be one of: {', '.join(sorted(allowed))}",
+        )
+    if body.job_type == "image_generate" and body.scene_id is None:
+        raise HTTPException(status_code=400, detail="image_generate requires scene_id")
+    payload = dict(body.payload or {})
+    if body.job_type == "image_generate" and "checkpoint" not in payload:
+        payload["checkpoint"] = get_settings().comfyui_checkpoint
     job = Job(
         project_id=project_id,
         scene_id=body.scene_id,
         job_type=body.job_type,
         status="queued",
-        payload=body.payload,
+        payload=payload,
     )
     session.add(job)
     await session.commit()

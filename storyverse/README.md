@@ -1,12 +1,14 @@
-# StoryVerse AI Studio — Phase 4 (Story / Script / Scenes)
+# StoryVerse AI Studio — Phase 5 (ComfyUI Image Adapter)
 
 > مجلد **معزول** عن تطبيق Flutter في جذر المستودع. لا يغيّر `lib/` أو `pubspec.yaml`.
 
-**Phase 4:** فكرة → مسودة سيناريو → قائمة مشاهد قابلة للتحرير (JSON) + قوالب نوع أدبي.  
-يبني على Phase 3 (SQLite + FastAPI + طابور عامل واحد).
+**Phase 5:** Adapter توليد صور عبر **ComfyUI HTTP** (`127.0.0.1:8188`) فوق Phase 4 (قصة/مشاهد).
 
-**بدون** تنزيل نماذج، **بدون** استدعاء ComfyUI، **بدون** APIs مدفوعة افتراضياً.  
-المولّد الافتراضي: **قوالب حتمية (template)** — لا ML.
+- Checkpoint الافتراضي: **`DreamShaper_8_pruned.safetensors`** (مثبت مسبقاً في Phase 2)
+- **لا** تنزيلات نماذج جديدة في الكود
+- **لا** APIs مدفوعة
+- طابور عامل واحد (job واحد ثقيل في كل مرة)
+- إصدارات صور لكل مشهد؛ إعادة توليد مشهد واحد لا تمسح المشروع
 
 ---
 
@@ -15,9 +17,10 @@
 ```text
 D:\StoryVerse\
   venv\
-  apps\comfyui\         # لا تلمسه
-  models\               # لا تنزّل شيئاً جديداً في Phase 4
-  app\                  # ← انسخ محتوى storyverse/ إلى هنا
+  apps\comfyui\              # محرك ComfyUI (شغّله على 8188 للاختبار الحي)
+  models\checkpoints\
+    DreamShaper_8_pruned.safetensors   # موجود — لا تنزّل بديله من التطبيق
+  app\                       # ← انسخ محتوى storyverse/ إلى هنا
   data\
   projects\
 ```
@@ -31,17 +34,10 @@ New-Item -ItemType Directory -Force -Path $dst | Out-Null
 robocopy $src $dst /E /XD .venv venv data .git __pycache__ /NFL /NDL /NJH /NJS
 
 $env:STORYVERSE_ROOT = "D:\StoryVerse"
-# دائم:
 setx STORYVERSE_ROOT "D:\StoryVerse"
 ```
 
-أو:
-
-```powershell
-Copy-Item -Recurse -Force .\storyverse\* D:\StoryVerse\app\
-```
-
-### تثبيت وتشغيل
+### تثبيت وتشغيل API
 
 ```powershell
 cd D:\StoryVerse
@@ -49,6 +45,9 @@ cd D:\StoryVerse
 cd app
 pip install -r requirements.txt
 $env:STORYVERSE_ROOT = "D:\StoryVerse"
+# اختياري — الافتراضي صحيح:
+# $env:STORYVERSE_COMFYUI_BASE_URL = "http://127.0.0.1:8188"
+# $env:STORYVERSE_COMFYUI_CHECKPOINT = "DreamShaper_8_pruned.safetensors"
 python -m app.main
 ```
 
@@ -60,80 +59,143 @@ python -m app.main
 
 | المسار | الوظيفة |
 |--------|---------|
-| `app/models.py` | جداول Phase 3 + حقول قصة/سيناريو/كاميرا/إضاءة/`content_tag` |
-| `app/story/templates.py` | قوالب: documentary, hollywood, mystery, historical, drama, adventure |
-| `app/story/generator.py` | مولّد حتمي → JSON قابل للتحرير |
-| `app/story/llm.py` | بوابات LLM اختيارية (مغلقة افتراضياً — موثّقة فقط) |
-| `scripts/smoke_test.py` | فكرة → مشاهد JSON + تعديل/إعادة ترتيب بدون ML |
+| `app/image/comfyui.py` | عميل HTTP لـ ComfyUI (`/prompt`, `/history`, `/view`) |
+| `app/image/workflow.py` | رسم SD1.5 txt2img → DreamShaper |
+| `app/image/adapter.py` | نسخ المخرجات إلى `projects/{id}/assets/scenes/{scene}/vNNN.png` |
+| `app/queue.py` | `fake` + **`image_generate`** (عامل واحد) |
+| `scripts/mock_comfyui.py` | خادم وهمي لـ CI بدون GPU |
+| `scripts/smoke_test.py` | دخان: قصة + صور عبر الـ mock |
 
 ---
 
-## نقاط API الرئيسية (Phase 4)
+## نقاط API الرئيسية (Phase 5)
 
 | Method | Path | وصف |
 |--------|------|-----|
-| GET | `/api/v1/story/genres` | قائمة القوالب |
-| GET | `/api/v1/story/llm-gates` | حالة بوابات LLM |
-| POST | `/api/v1/story/generate` | فكرة → مشروع + سيناريو + مشاهد |
-| GET | `/api/v1/projects/{id}/story` | JSON كامل قابل للتحرير |
-| PUT | `/api/v1/projects/{id}/story` | تعديل عنوان/ملخص/beats |
-| PATCH | `/api/v1/scenes/{id}` | تعديل يدوي لمشهد |
-| PUT | `/api/v1/projects/{id}/scenes/reorder` | إعادة ترتيب `{ "scene_ids": [...] }` |
+| POST | `/api/v1/scenes/{id}/generate-image` | طابور توليد صورة لمشهد واحد |
+| POST | `/api/v1/projects/{pid}/scenes/{sid}/generate-image` | نفس الأمر مع تحقق المشروع |
+| GET | `/api/v1/scenes/{id}/images` | كل إصدارات صور المشهد |
+| POST | `/api/v1/characters/{id}/ref-stub` | مجلد مراجع خفيف (بدون توليد) |
+| PATCH | `/api/v1/characters/{id}` | تحديث وصف / `visual_prompt` |
 
-### مثال توليد
+ما زالت نقاط Phase 4 (`/story/generate`, تعديل مشاهد، …) تعمل كما هي.
+
+### مثال توليد صورة لمشهد
 
 ```powershell
-curl -X POST http://127.0.0.1:8765/api/v1/story/generate `
+curl -X POST http://127.0.0.1:8765/api/v1/scenes/1/generate-image `
   -H "Content-Type: application/json" `
-  -d "{\"idea\":\"حارس منارة يفك شفرة أضواء سفينة مفقودة\",\"genre\":\"mystery\",\"true_story_mode\":false,\"language\":\"ar\"}"
+  -d "{\"seed\":42,\"steps\":20,\"character_ids\":[1]}"
 ```
 
-الاستجابة تتضمن: `title`, `synopsis`, `beats`, `scenes[]` مع `camera` / `lighting` / `prompt` / `content_tag`.
-
-### وضع القصة الحقيقية (true-story)
-
-عند `"true_story_mode": true` تُوسم المشاهد بـ `fact` أو `dramatization` (لا تُخلط مع الخيال دون وسم).
-
----
-
-## بوابات LLM (مغلقة افتراضياً)
-
-| متغير البيئة | افتراضي | المعنى |
-|--------------|---------|--------|
-| `STORYVERSE_ALLOW_LOCAL_LLM` | `0` / off | إذن LLM محلي فقط — Phase 4 **لا** يحمّل نماذج |
-| `STORYVERSE_ALLOW_CLOUD_LLM` | `0` / off | إذن سحابي |
-| `STORYVERSE_CLOUD_LLM_API_KEY` | فارغ | مطلوب مع العلم السحابي |
-
-حتى مع `STORYVERSE_ALLOW_CLOUD_LLM=1` ومفتاح موجود، Phase 4 **لا يستدعي** APIs مدفوعة تلقائياً؛ المولّد العامل يبقى القوالب. السحابي موثّق كمسار معلّق فقط.
-
-**لا تنزيلات نماذج. لا ComfyUI.**
-
----
-
-## اختبار الدخان (Smoke) — بدون ML
+الاستجابة: job من نوع `image_generate` بحالة `queued`. راقب:
 
 ```powershell
-cd D:\StoryVerse\app
-$env:STORYVERSE_ROOT = "D:\StoryVerse"
-.\venv\Scripts\Activate.ps1
+curl http://127.0.0.1:8765/api/v1/jobs/1
+curl http://127.0.0.1:8765/api/v1/scenes/1/images
+```
+
+الملفات تُحفظ تحت:
+
+```text
+D:\StoryVerse\projects\{project_id}\assets\scenes\{scene_id}\v001.png
+D:\StoryVerse\projects\{project_id}\assets\scenes\{scene_id}\v002.png  # بعد regenerate
+```
+
+إعادة التوليد **تضيف** إصداراً جديداً؛ لا تحذف `v001` ولا تمس مشاهد أخرى.
+
+---
+
+## اختبار الدخان (CI / بدون GPU) — Mock ComfyUI
+
+```powershell
+cd D:\StoryVerse\app   # أو storyverse/ في المستودع
+$env:STORYVERSE_ROOT = "D:\StoryVerse"   # أو اتركه فارغاً لمجلد مؤقت
 python scripts\smoke_test.py
 ```
 
 المتوقع:
 
-`PASS — idea→editable JSON scenes + edit/reorder (template generator, no ML)`
+`PASS — story + image_generate (mock ComfyUI) + versioned regenerate (no GPU / no model download)`
+
+الـ smoke يشغّل `scripts/mock_comfyui.py` محلياً على منفذ عشوائي ويضبط `STORYVERSE_COMFYUI_BASE_URL` تلقائياً.
+
+تشغيل الـ mock يدوياً:
+
+```powershell
+python scripts\mock_comfyui.py --port 18188
+```
 
 ---
 
-## سياسات Phase 4
+## اختبار حي على Windows (يتطلب ComfyUI شغّال)
 
-- لا تنزيل نماذج (SD / Wan / LTX / TTS / LLM).
-- لا استدعاء ComfyUI.
-- لا APIs مدفوعة افتراضياً؛ السحابي خلف علم + مفتاح وموثّق كمسار معلّق.
-- Phase 5+ تحتاج موافقة صريحة منفصلة.
+> هذا المسار **ليس** جزءاً من CI السحابي. يحتاج GPU المستخدم وComfyUI.
+
+1. تأكد أن النموذج موجود فقط محلياً (لا تنزيل من التطبيق):
+
+```powershell
+Get-Item "D:\StoryVerse\apps\comfyui\models\checkpoints\DreamShaper_8_pruned.safetensors"
+# أو المسار الذي يستخدمه ComfyUI لـ checkpoints إن كان مختلفاً
+```
+
+2. شغّل ComfyUI (واجهة على http://127.0.0.1:8188):
+
+```powershell
+cd D:\StoryVerse\apps\comfyui
+# حسب طريقة تثبيتك — مثال:
+.\venv\Scripts\Activate.ps1   # إن وُجد venv منفصل
+python main.py --listen 127.0.0.1 --port 8188
+```
+
+3. في طرفية أخرى شغّل StoryVerse API ثم:
+
+```powershell
+cd D:\StoryVerse\app
+.\venv\Scripts\Activate.ps1
+$env:STORYVERSE_ROOT = "D:\StoryVerse"
+$env:STORYVERSE_COMFYUI_BASE_URL = "http://127.0.0.1:8188"
+python -m app.main
+```
+
+4. ولّد قصة ثم صورة لمشهدين من `/docs` أو:
+
+```powershell
+# بعد POST /story/generate احصل على scene ids ثم:
+curl -X POST http://127.0.0.1:8765/api/v1/scenes/<SCENE_A>/generate-image -H "Content-Type: application/json" -d "{}"
+curl -X POST http://127.0.0.1:8765/api/v1/scenes/<SCENE_B>/generate-image -H "Content-Type: application/json" -d "{}"
+```
+
+5. تحقق من الملفات تحت `D:\StoryVerse\projects\...\assets\scenes\...` وصفوف `assets` في SQLite.
+
+**ملاحظة VRAM (6GB):** الطابور يضمن job صورة واحد في كل مرة؛ الدقة الافتراضية 512×512.
+
+---
+
+## متغيرات البيئة (Phase 5)
+
+| متغير | افتراضي | المعنى |
+|--------|---------|--------|
+| `STORYVERSE_ROOT` | `storyverse/data/root` | جذر البيانات/المشاريع |
+| `STORYVERSE_COMFYUI_BASE_URL` | `http://127.0.0.1:8188` | عنوان ComfyUI |
+| `STORYVERSE_COMFYUI_CHECKPOINT` | `DreamShaper_8_pruned.safetensors` | اسم ملف محلي فقط |
+| `STORYVERSE_COMFYUI_TIMEOUT_SEC` | `300` | مهلة انتظار المخرجات |
+| `STORYVERSE_COMFYUI_WIDTH` / `_HEIGHT` | `512` | سقف عملي لـ 6GB |
+| `STORYVERSE_ALLOW_*_LLM` | off | كما في Phase 4 |
+
+---
+
+## سياسات Phase 5
+
+- **لا** تنزيل نماذج من التطبيق (ممنوع URL/مسار تحميل في `checkpoint`).
+- استخدم **DreamShaper_8_pruned.safetensors** الموجود فقط.
+- عامل طابور واحد — لا توازي GPU.
+- إصدارات صور محفوظة؛ regenerate لمشهد واحد آمن.
+- مراجع الشخصيات: stub خفيف (`visual_prompt` + مجلد `refs/`) — بدون IP-Adapter افتراضياً.
+- Phase 6+ (فيديو) تحتاج موافقة صريحة منفصلة.
 
 ---
 
 ## عزل Flutter
 
-`storyverse/` مستقل تماماً. تطبيق Flutter بلا تغيير متعمد في Phase 4.
+`storyverse/` مستقل تماماً. تطبيق Flutter بلا تغيير متعمد في Phase 5.

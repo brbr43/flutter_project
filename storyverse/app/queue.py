@@ -1,7 +1,9 @@
 """Single-worker in-process job queue.
 
-Only one heavy/fake job runs at a time — Phase 3 exit criteria and Phase 1 GPU policy
-(no parallel heavy GPU jobs). Does NOT call ComfyUI or any ML.
+Only one heavy job runs at a time — Phase 1 GPU policy (serialize GPU work).
+Supports:
+  - fake           → Phase 3 marker file (no ML)
+  - image_generate → Phase 5 ComfyUI adapter (one scene; versions kept)
 """
 
 from __future__ import annotations
@@ -16,7 +18,6 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db import get_session_factory
 from app.models import Job
-from app.paths import ensure_project_layout
 
 logger = logging.getLogger("storyverse.queue")
 
@@ -99,42 +100,114 @@ class JobQueue:
             payload: dict[str, Any] = dict(job.payload or {})
             job_type = job.job_type
             project_id = job.project_id
+            scene_id = job.scene_id
             force_fail = bool(payload.get("force_fail"))
 
-        # Simulate work outside the DB transaction (no ML / no ComfyUI).
-        delay = float(payload.get("delay_sec", settings.fake_job_delay_sec))
-        await asyncio.sleep(max(0.0, delay))
+        try:
+            if force_fail:
+                raise RuntimeError(payload.get("fail_message", "Forced fake failure"))
 
-        async with factory() as session:
-            job = await session.get(Job, job_id)
-            if job is None:
-                return
-            try:
-                if force_fail:
-                    raise RuntimeError(payload.get("fail_message", "Forced fake failure"))
-
-                layout = ensure_project_layout(project_id, settings)
-                marker = layout["scratch"] / f"job_{job_id}.done"
-                marker.write_text(
-                    f"job_type={job_type}\nstatus=done\n",
-                    encoding="utf-8",
+            if job_type == "image_generate":
+                result = await self._run_image_generate(
+                    job_id=job_id,
+                    project_id=project_id,
+                    scene_id=scene_id,
+                    payload=payload,
+                    settings=settings,
                 )
+            elif job_type == "fake":
+                result = await self._run_fake(
+                    job_id=job_id,
+                    job_type=job_type,
+                    project_id=project_id,
+                    payload=payload,
+                    settings=settings,
+                )
+            else:
+                raise RuntimeError(
+                    f"Unknown job_type={job_type!r}. "
+                    "Phase 5 supports: fake, image_generate"
+                )
+
+            async with factory() as session:
+                job = await session.get(Job, job_id)
+                if job is None:
+                    return
                 job.status = "done"
-                job.result = {
-                    "ok": True,
-                    "job_type": job_type,
-                    "marker": str(marker),
-                    "note": "Phase 3 fake job — no ComfyUI/ML invoked",
-                }
+                job.result = result
                 job.error_message = None
-            except Exception as exc:  # noqa: BLE001
+                job.finished_at = utcnow()
+                await session.commit()
+
+        except Exception as exc:  # noqa: BLE001
+            async with factory() as session:
+                job = await session.get(Job, job_id)
+                if job is None:
+                    return
                 job.status = "failed"
                 job.result = {"ok": False}
                 job.error_message = str(exc)
-                logger.warning("Job %s failed: %s", job_id, exc)
-            finally:
                 job.finished_at = utcnow()
                 await session.commit()
+            logger.warning("Job %s failed: %s", job_id, exc)
+
+    async def _run_fake(
+        self,
+        *,
+        job_id: int,
+        job_type: str,
+        project_id: int,
+        payload: dict[str, Any],
+        settings: Any,
+    ) -> dict[str, Any]:
+        from app.paths import ensure_project_layout
+
+        delay = float(payload.get("delay_sec", settings.fake_job_delay_sec))
+        await asyncio.sleep(max(0.0, delay))
+        layout = ensure_project_layout(project_id, settings)
+        marker = layout["scratch"] / f"job_{job_id}.done"
+        marker.write_text(
+            f"job_type={job_type}\nstatus=done\n",
+            encoding="utf-8",
+        )
+        return {
+            "ok": True,
+            "job_type": job_type,
+            "marker": str(marker),
+            "note": "Phase 3 fake job — no ComfyUI/ML invoked",
+        }
+
+    async def _run_image_generate(
+        self,
+        *,
+        job_id: int,
+        project_id: int,
+        scene_id: Optional[int],
+        payload: dict[str, Any],
+        settings: Any,
+    ) -> dict[str, Any]:
+        if scene_id is None:
+            raise RuntimeError("image_generate requires scene_id")
+
+        from app.image.adapter import generate_scene_image
+        from app.image.comfyui import ComfyUIClient
+
+        client = ComfyUIClient(
+            settings.comfyui_base_url,
+            timeout_sec=settings.comfyui_timeout_sec,
+            poll_interval_sec=settings.comfyui_poll_interval_sec,
+        )
+        factory = get_session_factory()
+        async with factory() as session:
+            return await generate_scene_image(
+                session,
+                project_id=project_id,
+                scene_id=scene_id,
+                job_id=job_id,
+                payload=payload,
+                settings=settings,
+                client=client,
+            )
 
 
 # Process-wide singleton (one GPU-style worker for the API process)

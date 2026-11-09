@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     # Fake job simulation delay (seconds) for smoke / demo workers
     fake_job_delay_sec: float = 0.25
     api_title: str = "StoryVerse Internal API"
-    api_version: str = "0.4.0"
+    api_version: str = "0.5.0"
 
     # Phase 4 — LLM gates (OFF by default; no model downloads; no paid APIs)
     # STORYVERSE_ALLOW_LOCAL_LLM=1  → local LLM *permission* only (still unused in Phase 4)
@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     allow_local_llm: bool = False
     allow_cloud_llm: bool = False
     cloud_llm_api_key: str = ""
+
+    # Phase 5 — ComfyUI image adapter (local HTTP only; NO model downloads)
+    # Checkpoint must already exist in ComfyUI models/checkpoints/ (Phase 2 installed
+    # DreamShaper_8_pruned.safetensors on the user's Windows box).
+    comfyui_base_url: str = "http://127.0.0.1:8188"
+    comfyui_checkpoint: str = "DreamShaper_8_pruned.safetensors"
+    comfyui_timeout_sec: float = 300.0
+    comfyui_poll_interval_sec: float = 0.5
+    comfyui_width: int = 512
+    comfyui_height: int = 512
+    comfyui_steps: int = 20
+    comfyui_cfg: float = 7.0
 
 
     def model_post_init(self, __context: object) -> None:
