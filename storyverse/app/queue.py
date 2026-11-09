@@ -4,6 +4,7 @@ Only one heavy job runs at a time — Phase 1 GPU policy (serialize GPU work).
 Supports:
   - fake           → Phase 3 marker file (no ML)
   - image_generate → Phase 5 ComfyUI adapter (one scene; versions kept)
+  - video_generate → Phase 6 clip adapter (FFmpeg fallback by default; AI gated)
 """
 
 from __future__ import annotations
@@ -115,6 +116,14 @@ class JobQueue:
                     payload=payload,
                     settings=settings,
                 )
+            elif job_type == "video_generate":
+                result = await self._run_video_generate(
+                    job_id=job_id,
+                    project_id=project_id,
+                    scene_id=scene_id,
+                    payload=payload,
+                    settings=settings,
+                )
             elif job_type == "fake":
                 result = await self._run_fake(
                     job_id=job_id,
@@ -126,7 +135,7 @@ class JobQueue:
             else:
                 raise RuntimeError(
                     f"Unknown job_type={job_type!r}. "
-                    "Phase 5 supports: fake, image_generate"
+                    "Phase 6 supports: fake, image_generate, video_generate"
                 )
 
             async with factory() as session:
@@ -207,6 +216,31 @@ class JobQueue:
                 payload=payload,
                 settings=settings,
                 client=client,
+            )
+
+    async def _run_video_generate(
+        self,
+        *,
+        job_id: int,
+        project_id: int,
+        scene_id: Optional[int],
+        payload: dict[str, Any],
+        settings: Any,
+    ) -> dict[str, Any]:
+        if scene_id is None:
+            raise RuntimeError("video_generate requires scene_id")
+
+        from app.video.adapter import generate_scene_clip
+
+        factory = get_session_factory()
+        async with factory() as session:
+            return await generate_scene_clip(
+                session,
+                project_id=project_id,
+                scene_id=scene_id,
+                job_id=job_id,
+                payload=payload,
+                settings=settings,
             )
 
 

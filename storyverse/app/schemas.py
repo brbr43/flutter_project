@@ -1,4 +1,4 @@
-"""Pydantic request/response schemas — Phase 3–5 (story + ComfyUI images)."""
+"""Pydantic request/response schemas — Phase 3–6 (story + images + clips)."""
 
 from __future__ import annotations
 
@@ -286,6 +286,45 @@ class ImageGenerateOut(BaseModel):
     )
 
 
+# --- Video clips (Phase 6) ---
+
+
+class VideoGenerateRequest(BaseModel):
+    """Trigger short clip generation for one scene (queued, single worker).
+
+    Default engine is ffmpeg_kenburns (labeled non-AI fallback). AI engines
+    (comfyui_wan / comfyui_ltx) require STORYVERSE_ALLOW_AI_VIDEO=1 and are
+    stubs until models are approved + installed locally — no auto-download.
+    """
+
+    engine: Optional[str] = None  # override settings.video_engine
+    duration_sec: Optional[float] = None
+    fps: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    source_image_path: Optional[str] = None  # local path only
+    model: Optional[str] = None  # local filename only (AI engines)
+
+
+class VideoGenerateOut(BaseModel):
+    job: JobOut
+    scene_id: int
+    project_id: int
+    note: str = (
+        "Queued video_generate. Default path is FFmpeg Ken Burns fallback "
+        "(NOT AI video). Prior clip versions are kept."
+    )
+
+
+class VideoGateOut(BaseModel):
+    engine: str
+    allow_ai_video: bool
+    allow_video_model_download: bool
+    ai_video_active: bool
+    is_fallback: bool
+    notes: list[str]
+
+
 # --- Settings ---
 
 
@@ -316,3 +355,8 @@ class HealthOut(BaseModel):
     comfyui_base_url: str = "http://127.0.0.1:8188"
     comfyui_checkpoint: str = "DreamShaper_8_pruned.safetensors"
     image_engine: str = "comfyui"
+    video_engine: str = "ffmpeg_kenburns"
+    allow_ai_video: bool = False
+    allow_video_model_download: bool = False
+    ai_video_active: bool = False
+    video_is_fallback: bool = True

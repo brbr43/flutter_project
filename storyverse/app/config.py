@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     # Fake job simulation delay (seconds) for smoke / demo workers
     fake_job_delay_sec: float = 0.25
     api_title: str = "StoryVerse Internal API"
-    api_version: str = "0.5.0"
+    api_version: str = "0.6.0"
 
     # Phase 4 — LLM gates (OFF by default; no model downloads; no paid APIs)
     # STORYVERSE_ALLOW_LOCAL_LLM=1  → local LLM *permission* only (still unused in Phase 4)
@@ -59,6 +59,23 @@ class Settings(BaseSettings):
     comfyui_height: int = 512
     comfyui_steps: int = 20
     comfyui_cfg: float = 7.0
+
+    # Phase 6 — short clips (default = non-AI FFmpeg Ken Burns fallback)
+    # STORYVERSE_VIDEO_ENGINE=ffmpeg_kenburns|mock|comfyui_wan|comfyui_ltx
+    # STORYVERSE_ALLOW_AI_VIDEO=1 → permission only; still needs local models + future wiring
+    # STORYVERSE_ALLOW_VIDEO_MODEL_DOWNLOAD=1 → user approval for *manual* install only;
+    #   this codebase NEVER auto-downloads Wan/LTX weights.
+    video_engine: str = "ffmpeg_kenburns"
+    allow_ai_video: bool = False
+    allow_video_model_download: bool = False
+    video_wan_model: str = "wan2.1_t2v_1.3B_fp8.safetensors"
+    video_ltx_model: str = "ltx-video-2b-v0.9.distilled.safetensors"
+    video_duration_sec: float = 3.0
+    video_max_duration_sec: float = 8.0
+    video_fps: int = 12
+    video_width: int = 512
+    video_height: int = 512
+    video_timeout_sec: float = 180.0
 
 
     def model_post_init(self, __context: object) -> None:

@@ -1,4 +1,4 @@
-"""HTTP endpoints — Phase 3–5 (story + ComfyUI scene images)."""
+"""HTTP endpoints — Phase 3–6 (story + images + short clips)."""
 
 from __future__ import annotations
 
@@ -40,10 +40,15 @@ from app.schemas import (
     StoryDraftOut,
     StoryGenerateRequest,
     StoryUpdate,
+    VideoGateOut,
+    VideoGenerateOut,
+    VideoGenerateRequest,
 )
 from app.story.generator import generate_story_draft, list_genres
 from app.story.llm import inspect_llm_gates
 from app.story.templates import CONTENT_TAGS, GENRE_IDS
+from app.video.adapter import ASSET_KIND_SCENE_CLIP
+from app.video.gates import KNOWN_ENGINES, assert_no_download_urls, inspect_video_gates
 
 router = APIRouter()
 
@@ -55,6 +60,7 @@ router = APIRouter()
 async def health() -> HealthOut:
     settings = get_settings()
     gate = inspect_llm_gates(settings)
+    vgate = inspect_video_gates(settings)
     return HealthOut(
         status="ok",
         version=settings.api_version,
@@ -67,7 +73,18 @@ async def health() -> HealthOut:
         comfyui_base_url=settings.comfyui_base_url,
         comfyui_checkpoint=settings.comfyui_checkpoint,
         image_engine="comfyui",
+        video_engine=vgate.engine,
+        allow_ai_video=vgate.allow_ai_video,
+        allow_video_model_download=vgate.allow_video_model_download,
+        ai_video_active=vgate.ai_video_active,
+        video_is_fallback=vgate.is_fallback,
     )
+
+
+@router.get("/video/gates", response_model=VideoGateOut)
+async def video_gates() -> VideoGateOut:
+    g = inspect_video_gates()
+    return VideoGateOut(**g.as_dict())
 
 
 @router.get("/story/llm-gates", response_model=LLMGateOut)
@@ -752,6 +769,133 @@ async def list_scene_images(
     return list(result.scalars())
 
 
+# ----- Scene clip generation (Phase 6) -----
+
+
+def _video_payload(body: VideoGenerateRequest) -> dict[str, Any]:
+    settings = get_settings()
+    payload: dict[str, Any] = {}
+    engine = (body.engine or settings.video_engine or "ffmpeg_kenburns").strip().lower()
+    if engine not in KNOWN_ENGINES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"engine must be one of: {', '.join(sorted(KNOWN_ENGINES))}",
+        )
+    payload["engine"] = engine
+    if body.duration_sec is not None:
+        payload["duration_sec"] = body.duration_sec
+    if body.fps is not None:
+        payload["fps"] = body.fps
+    if body.width is not None:
+        payload["width"] = body.width
+    if body.height is not None:
+        payload["height"] = body.height
+    if body.source_image_path is not None:
+        try:
+            assert_no_download_urls(body.source_image_path, field="source_image_path")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        payload["source_image_path"] = body.source_image_path
+    if body.model is not None:
+        try:
+            assert_no_download_urls(body.model, field="model")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if "/" in body.model or "\\" in body.model:
+            raise HTTPException(
+                status_code=400,
+                detail="model must be a local filename only (no paths / no download URLs)",
+            )
+        payload["model"] = body.model.strip()
+    return payload
+
+
+async def _enqueue_video_job(
+    session: AsyncSession,
+    *,
+    project_id: int,
+    scene_id: int,
+    body: VideoGenerateRequest,
+) -> Job:
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    scene = await session.get(Scene, scene_id)
+    if scene is None or scene.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Scene not found in this project")
+    job = Job(
+        project_id=project_id,
+        scene_id=scene_id,
+        job_type="video_generate",
+        status="queued",
+        payload=_video_payload(body),
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    await job_queue.enqueue(job.id)
+    return job
+
+
+@router.post(
+    "/scenes/{scene_id}/generate-clip",
+    response_model=VideoGenerateOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def generate_scene_clip_job(
+    scene_id: int,
+    body: VideoGenerateRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> VideoGenerateOut:
+    """Queue short clip for one scene (default: FFmpeg Ken Burns fallback, not AI)."""
+    scene = await session.get(Scene, scene_id)
+    if scene is None:
+        raise HTTPException(status_code=404, detail="Scene not found")
+    job = await _enqueue_video_job(
+        session,
+        project_id=scene.project_id,
+        scene_id=scene_id,
+        body=body or VideoGenerateRequest(),
+    )
+    return VideoGenerateOut(job=job, scene_id=scene_id, project_id=scene.project_id)
+
+
+@router.post(
+    "/projects/{project_id}/scenes/{scene_id}/generate-clip",
+    response_model=VideoGenerateOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def generate_project_scene_clip_job(
+    project_id: int,
+    scene_id: int,
+    body: VideoGenerateRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> VideoGenerateOut:
+    job = await _enqueue_video_job(
+        session,
+        project_id=project_id,
+        scene_id=scene_id,
+        body=body or VideoGenerateRequest(),
+    )
+    return VideoGenerateOut(job=job, scene_id=scene_id, project_id=project_id)
+
+
+@router.get("/scenes/{scene_id}/clips", response_model=list[AssetOut])
+async def list_scene_clips(
+    scene_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> list[Asset]:
+    scene = await session.get(Scene, scene_id)
+    if scene is None:
+        raise HTTPException(status_code=404, detail="Scene not found")
+    result = await session.execute(
+        select(Asset)
+        .where(Asset.scene_id == scene_id, Asset.kind == ASSET_KIND_SCENE_CLIP)
+        .order_by(Asset.id)
+    )
+    return list(result.scalars())
+
+
 # ----- Jobs -----
 
 
@@ -772,7 +916,7 @@ async def create_job(
         scene = await session.get(Scene, body.scene_id)
         if scene is None or scene.project_id != project_id:
             raise HTTPException(status_code=400, detail="scene_id not in this project")
-    allowed = {"fake", "image_generate"}
+    allowed = {"fake", "image_generate", "video_generate"}
     if body.job_type not in allowed:
         raise HTTPException(
             status_code=400,
@@ -780,9 +924,26 @@ async def create_job(
         )
     if body.job_type == "image_generate" and body.scene_id is None:
         raise HTTPException(status_code=400, detail="image_generate requires scene_id")
+    if body.job_type == "video_generate" and body.scene_id is None:
+        raise HTTPException(status_code=400, detail="video_generate requires scene_id")
     payload = dict(body.payload or {})
     if body.job_type == "image_generate" and "checkpoint" not in payload:
         payload["checkpoint"] = get_settings().comfyui_checkpoint
+    if body.job_type == "video_generate" and "engine" not in payload:
+        payload["engine"] = get_settings().video_engine
+    if body.job_type == "video_generate":
+        eng = str(payload.get("engine") or "").strip().lower()
+        if eng and eng not in KNOWN_ENGINES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"engine must be one of: {', '.join(sorted(KNOWN_ENGINES))}",
+            )
+        for key in ("source_image_path", "model"):
+            if key in payload and payload[key] is not None:
+                try:
+                    assert_no_download_urls(str(payload[key]), field=key)
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
     job = Job(
         project_id=project_id,
         scene_id=body.scene_id,
